@@ -1,16 +1,47 @@
 #!/bin/bash
 # ==============================================================================
 # Скрипт настройки хоста HQ-RTR (Маршрутизатор HQ)
+# Поддерживает VirtualBox, Proxmox, VMware (автоопределение интерфейсов)
 # ==============================================================================
 set -e
 
-# Переменные (при необходимости измените под свой вариант)
+# --- ПЕРЕМЕННЫЕ ПОД ВАШ ВАРИАНТ ---
 HOSTNAME="hq-rtr.au-team.irpo"
 TIMEZONE="Europe/Moscow"
 DOMAIN="au-team.irpo"
 OSPF_KEY="P@ssw0rd"
 ADMIN_USER="net_admin"
 ADMIN_PASS="P@ssw0rd"
+
+# Сети и VLAN
+IP_ISP="172.16.1.2/28"
+GW_ISP="172.16.1.1"
+REMOTE_BR="172.16.2.2"
+TUN_IP="10.10.10.1/30"
+
+VLAN100_ID=100
+VLAN100_IP="192.168.100.1/27"
+
+VLAN200_ID=200
+VLAN200_IP="192.168.200.1/28"
+
+VLAN999_ID=999
+VLAN999_IP="192.168.99.1/29"
+
+# DHCP настройки для VLAN 200
+DHCP_NET="192.168.200.0"
+DHCP_MASK="255.255.255.240"
+DHCP_START="192.168.200.2"
+DHCP_END="192.168.200.14"
+DHCP_DNS="192.168.100.2"
+DHCP_ROUTER="192.168.200.1"
+
+# --- АВТООПРЕДЕЛЕНИЕ СЕТЕВЫХ ИНТЕРФЕЙСОВ ---
+ETH=($(ip -o link show | awk -F': ' '$2 !~ /^(lo|tun|vlan|virbr|docker)/ {print $2}'))
+INT_ISP="${ETH[0]}"  # 1-й адаптер: В сторону ISP
+INT_LAN="${ETH[1]}"  # 2-й адаптер: Внутренний свитч HQ
+
+echo "=== Определены интерфейсы: ISP=$INT_ISP, LAN=$INT_LAN ==="
 
 echo "[1/7] Имя хоста, часовой пояс, модуль 8021q и ip_forward..."
 hostnamectl set-hostname "$HOSTNAME"
@@ -22,7 +53,6 @@ sysctl -p
 modprobe 8021q
 echo "8021q" > /etc/modules-load.d/8021q.conf
 
-# Создание пользователя net_admin для проверки SSH-доступа
 if ! id "$ADMIN_USER" &>/dev/null; then
     useradd "$ADMIN_USER" -U
     echo "$ADMIN_USER:$ADMIN_PASS" | chpasswd
@@ -30,50 +60,50 @@ if ! id "$ADMIN_USER" &>/dev/null; then
 fi
 
 echo "[2/7] Настройка интерфейсов и VLAN (802.1Q)..."
-# Очистка старых профилей
-nmcli connection delete "ISP-HQ" 2>/dev/null || true
-nmcli connection delete "vlan100" 2>/dev/null || true
-nmcli connection delete "vlan200" 2>/dev/null || true
-nmcli connection delete "vlan999" 2>/dev/null || true
+# Удаляем старые подключения на этих интерфейсах
+nmcli -t -f UUID,DEVICE connection show | awk -F: -v d="$INT_ISP" '$2==d {print $1}' | xargs -r nmcli connection delete
+nmcli -t -f UUID,DEVICE connection show | awk -F: -v d="$INT_LAN" '$2==d {print $1}' | xargs -r nmcli connection delete
+nmcli connection delete "vlan$VLAN100_ID" 2>/dev/null || true
+nmcli connection delete "vlan$VLAN200_ID" 2>/dev/null || true
+nmcli connection delete "vlan$VLAN999_ID" 2>/dev/null || true
 nmcli connection delete "tun1" 2>/dev/null || true
 
 # Внешний интерфейс в сторону ISP
-nmcli connection add type ethernet ifname enp0s3 con-name "ISP-HQ" \
-    ip4 172.16.1.2/28 gw4 172.16.1.1 ipv4.dns 77.88.8.8 ipv6.method disabled
+nmcli connection add type ethernet ifname "$INT_ISP" con-name "ISP-HQ" \
+    ip4 "$IP_ISP" gw4 "$GW_ISP" ipv4.dns 77.88.8.8 ipv6.method disabled
 
-# Активация физического интерфейса enp0s8 под VLAN
-nmcli connection add type ethernet ifname enp0s8 con-name "enp0s8" ipv4.method disabled ipv6.method disabled 2>/dev/null || true
+# Активация физического интерфейса под VLAN
+nmcli connection add type ethernet ifname "$INT_LAN" con-name "$INT_LAN" ipv4.method disabled ipv6.method disabled 2>/dev/null || true
 
 # Сабинтерфейсы VLAN
-nmcli connection add type vlan ifname vlan100 con-name "vlan100" dev enp0s8 id 100 \
-    ip4 192.168.100.1/27 ipv6.method disabled
+nmcli connection add type vlan ifname "vlan$VLAN100_ID" con-name "vlan$VLAN100_ID" dev "$INT_LAN" id "$VLAN100_ID" \
+    ip4 "$VLAN100_IP" ipv6.method disabled
 
-nmcli connection add type vlan ifname vlan200 con-name "vlan200" dev enp0s8 id 200 \
-    ip4 192.168.200.1/28 ipv6.method disabled
+nmcli connection add type vlan ifname "vlan$VLAN200_ID" con-name "vlan$VLAN200_ID" dev "$INT_LAN" id "$VLAN200_ID" \
+    ip4 "$VLAN200_IP" ipv6.method disabled
 
-nmcli connection add type vlan ifname vlan999 con-name "vlan999" dev enp0s8 id 999 \
-    ip4 192.168.99.1/29 ipv6.method disabled
+nmcli connection add type vlan ifname "vlan$VLAN999_ID" con-name "vlan$VLAN999_ID" dev "$INT_LAN" id "$VLAN999_ID" \
+    ip4 "$VLAN999_IP" ipv6.method disabled
 
 echo "[3/7] Настройка GRE-туннеля tun1..."
 nmcli connection add type ip-tunnel ifname tun1 con-name "tun1" mode gre \
-    parent enp0s3 local 172.16.1.2 remote 172.16.2.2 \
-    ip4 10.10.10.1/30 ipv6.method disabled
+    parent "$INT_ISP" local "${IP_ISP%/*}" remote "$REMOTE_BR" \
+    ip4 "$TUN_IP" ipv6.method disabled
 nmcli connection modify tun1 ip-tunnel.ttl 64
 
-# Поднимаем все соединения
 nmcli connection up "ISP-HQ" || true
-nmcli connection up "vlan100" || true
-nmcli connection up "vlan200" || true
-nmcli connection up "vlan999" || true
+nmcli connection up "vlan$VLAN100_ID" || true
+nmcli connection up "vlan$VLAN200_ID" || true
+nmcli connection up "vlan$VLAN999_ID" || true
 nmcli connection up "tun1" || true
 
 echo "[4/7] Настройка NAT (nftables)..."
 mkdir -p /etc/nftables
-cat << 'EOF' > /etc/nftables/hq-rtr.nft
+cat << EOF > /etc/nftables/hq-rtr.nft
 table inet nat {
     chain POSTROUTING {
         type nat hook postrouting priority srcnat;
-        oifname "enp0s3" masquerade
+        oifname "$INT_ISP" masquerade
     }
 }
 EOF
@@ -89,11 +119,11 @@ echo "[5/7] Установка и настройка DHCP-сервера..."
 dnf install -y dhcp-server
 
 cat << EOF > /etc/dhcp/dhcpd.conf
-subnet 192.168.200.0 netmask 255.255.255.240 {
-  range 192.168.200.2 192.168.200.14;
-  option domain-name-servers 192.168.100.2;
+subnet $DHCP_NET netmask $DHCP_MASK {
+  range $DHCP_START $DHCP_END;
+  option domain-name-servers $DHCP_DNS;
   option domain-name "$DOMAIN";
-  option routers 192.168.200.1;
+  option routers $DHCP_ROUTER;
   default-lease-time 600;
   max-lease-time 7200;
 }

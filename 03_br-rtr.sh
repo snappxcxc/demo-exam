@@ -1,12 +1,28 @@
 #!/bin/bash
 # ==============================================================================
 # Скрипт настройки хоста BR-RTR (Маршрутизатор филиала BR)
+# Поддерживает VirtualBox, Proxmox, VMware (автоопределение интерфейсов)
 # ==============================================================================
 set -e
 
+# --- ПЕРЕМЕННЫЕ ПОД ВАШ ВАРИАНТ ---
 HOSTNAME="br-rtr.au-team.irpo"
 TIMEZONE="Europe/Moscow"
 OSPF_KEY="P@ssw0rd"
+
+IP_ISP="172.16.2.2/28"
+GW_ISP="172.16.2.1"
+REMOTE_HQ="172.16.1.2"
+TUN_IP="10.10.10.2/30"
+
+IP_FW_NET="172.16.10.1/30"
+
+# --- АВТООПРЕДЕЛЕНИЕ СЕТЕВЫХ ИНТЕРФЕЙСОВ ---
+ETH=($(ip -o link show | awk -F': ' '$2 !~ /^(lo|tun|vlan|virbr|docker)/ {print $2}'))
+INT_ISP="${ETH[0]}" # 1-й адаптер: К провайдеру ISP
+INT_FW="${ETH[1]}"  # 2-й адаптер: К межсетевому экрану BR-FW
+
+echo "=== Определены интерфейсы: ISP=$INT_ISP, FW=$INT_FW ==="
 
 echo "[1/5] Имя хоста, часовой пояс и ip_forward..."
 hostnamectl set-hostname "$HOSTNAME"
@@ -16,36 +32,35 @@ grep -q "^net.ipv4.ip_forward=1" /etc/sysctl.conf || echo "net.ipv4.ip_forward=1
 sysctl -p
 
 echo "[2/5] Настройка сетевых интерфейсов..."
-nmcli connection delete "ISP-BR" 2>/dev/null || true
-nmcli connection delete "FW-NET" 2>/dev/null || true
+nmcli -t -f UUID,DEVICE connection show | awk -F: -v d="$INT_ISP" '$2==d {print $1}' | xargs -r nmcli connection delete
+nmcli -t -f UUID,DEVICE connection show | awk -F: -v d="$INT_FW" '$2==d {print $1}' | xargs -r nmcli connection delete
 nmcli connection delete "tun1" 2>/dev/null || true
 
 # В сторону провайдера
-nmcli connection add type ethernet ifname enp0s3 con-name "ISP-BR" \
-    ip4 172.16.2.2/28 gw4 172.16.2.1 ipv4.dns 77.88.8.8 ipv6.method disabled
+nmcli connection add type ethernet ifname "$INT_ISP" con-name "ISP-BR" \
+    ip4 "$IP_ISP" gw4 "$GW_ISP" ipv4.dns 77.88.8.8 ipv6.method disabled
 
 # В сторону межсетевого экрана BR-FW
-nmcli connection add type ethernet ifname enp0s8 con-name "FW-NET" \
-    ip4 172.16.10.1/30 ipv6.method disabled
+nmcli connection add type ethernet ifname "$INT_FW" con-name "FW-NET" \
+    ip4 "$IP_FW_NET" ipv6.method disabled
 
 echo "[3/5] Настройка GRE-туннеля tun1..."
 nmcli connection add type ip-tunnel ifname tun1 con-name "tun1" mode gre \
-    parent enp0s3 local 172.16.2.2 remote 172.16.1.2 \
-    ip4 10.10.10.2/30 ipv6.method disabled
+    parent "$INT_ISP" local "${IP_ISP%/*}" remote "$REMOTE_HQ" \
+    ip4 "$TUN_IP" ipv6.method disabled
 nmcli connection modify tun1 ip-tunnel.ttl 64
 
-# Поднимаем подключения
 nmcli connection up "ISP-BR" || true
 nmcli connection up "FW-NET" || true
 nmcli connection up "tun1" || true
 
 echo "[4/5] Настройка NAT (nftables)..."
 mkdir -p /etc/nftables
-cat << 'EOF' > /etc/nftables/br-rtr.nft
+cat << EOF > /etc/nftables/br-rtr.nft
 table inet nat {
     chain POSTROUTING {
         type nat hook postrouting priority srcnat;
-        oifname "enp0s3" masquerade
+        oifname "$INT_ISP" masquerade
     }
 }
 EOF
@@ -71,7 +86,7 @@ interface tun1
  ip ospf message-digest-key 1 md5 $OSPF_KEY
  no ip ospf passive
 !
-interface enp0s8
+interface $INT_FW
  no ip ospf passive
 !
 router ospf

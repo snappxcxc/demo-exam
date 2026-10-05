@@ -1,17 +1,29 @@
 #!/bin/bash
 # ==============================================================================
 # Скрипт настройки хоста HQ-SRV (Сервер HQ: DNS, SSH-hardening)
+# Поддерживает VirtualBox, Proxmox, VMware (автоопределение интерфейсов)
 # ==============================================================================
 set -e
 
-# Переменные (при необходимости измените под свой вариант)
+# --- ПЕРЕМЕННЫЕ ПОД ВАШ ВАРИАНТ ---
 HOSTNAME="hq-srv.au-team.irpo"
 TIMEZONE="Europe/Moscow"
 DOMAIN="au-team.irpo"
+
 SSH_USER="sshuser"
 SSH_UID="2027"
 SSH_PASS="P@ssw0rd"
 SSH_PORT="2027"
+
+VLAN_ID=100
+IP_SRV="192.168.100.2/27"
+GW_SRV="192.168.100.1"
+
+# --- АВТООПРЕДЕЛЕНИЕ СЕТЕВОГО ИНТЕРФЕЙСА ---
+ETH=($(ip -o link show | awk -F': ' '$2 !~ /^(lo|tun|vlan|virbr|docker)/ {print $2}'))
+INT_LAN="${ETH[0]}" # Физический адаптер, подключенный к сети
+
+echo "=== Определен интерфейс: $INT_LAN ==="
 
 echo "[1/5] Имя хоста, часовой пояс и создание пользователя..."
 hostnamectl set-hostname "$HOSTNAME"
@@ -24,23 +36,21 @@ fi
 echo "$SSH_USER ALL=(ALL) NOPASSWD: ALL" > "/etc/sudoers.d/$SSH_USER"
 chmod 0440 "/etc/sudoers.d/$SSH_USER"
 
-echo "[2/5] Настройка сети (VLAN 100 на enp0s3)..."
-nmcli connection delete "vlan100" 2>/dev/null || true
-nmcli connection delete "enp0s3" 2>/dev/null || true
+echo "[2/5] Настройка сети (VLAN $VLAN_ID на $INT_LAN)..."
+nmcli -t -f UUID,DEVICE connection show | awk -F: -v d="$INT_LAN" '$2==d {print $1}' | xargs -r nmcli connection delete
+nmcli connection delete "vlan$VLAN_ID" 2>/dev/null || true
 
-nmcli connection add type vlan ifname vlan100 con-name "vlan100" dev enp0s3 id 100 \
-    ip4 192.168.100.2/27 gw4 192.168.100.1 ipv4.dns "192.168.100.2 77.88.8.8" ipv6.method disabled
+nmcli connection add type vlan ifname "vlan$VLAN_ID" con-name "vlan$VLAN_ID" dev "$INT_LAN" id "$VLAN_ID" \
+    ip4 "$IP_SRV" gw4 "$GW_SRV" ipv4.dns "192.168.100.2 77.88.8.8" ipv6.method disabled
 
-nmcli connection up "vlan100" || true
+nmcli connection up "vlan$VLAN_ID" || true
 
 echo "[3/5] Безопасность SSH (Порт $SSH_PORT, баннер, ограничение пользователей)..."
 dnf install -y policycoreutils-python-utils
 
-# Настройка SELinux для порта
 semanage port -a -t ssh_port_t -p tcp "$SSH_PORT" 2>/dev/null || \
 semanage port -m -t ssh_port_t -p tcp "$SSH_PORT" 2>/dev/null || true
 
-# Баннер
 cat << 'EOF' > /etc/ssh_banner
 ***************************
 *                         *
@@ -49,7 +59,6 @@ cat << 'EOF' > /etc/ssh_banner
 ***************************
 EOF
 
-# Правка sshd_config
 sed -i "s/^#\?Port .*/Port $SSH_PORT/" /etc/ssh/sshd_config
 sed -i "s/^#\?MaxAuthTries .*/MaxAuthTries 2/" /etc/ssh/sshd_config
 sed -i "s/^#\?Banner .*/Banner \/etc\/ssh_banner/" /etc/ssh/sshd_config
@@ -112,7 +121,6 @@ EOF
 
 mkdir -p /var/named/master
 
-# Прямая зона
 cat << EOF > /var/named/master/au-team.db
 \$TTL 1D
 @       IN SOA  $DOMAIN. root.$DOMAIN. (
@@ -135,7 +143,6 @@ docker  IN A    172.16.1.1
 web     IN A    172.16.2.1
 EOF
 
-# Обратная зона HQ (192.168.100.0/27)
 cat << EOF > /var/named/master/au-team_rev1.db
 \$TTL 1D
 @       IN SOA  $DOMAIN. root.$DOMAIN. (
@@ -148,7 +155,6 @@ cat << EOF > /var/named/master/au-team_rev1.db
 2       IN PTR  hq-srv.$DOMAIN.
 EOF
 
-# Обратная зона BR (172.16.20.0/28)
 cat << EOF > /var/named/master/au-team_rev2.db
 \$TTL 1D
 @       IN SOA  $DOMAIN. root.$DOMAIN. (

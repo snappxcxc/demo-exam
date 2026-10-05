@@ -1,11 +1,25 @@
 #!/bin/bash
 # ==============================================================================
 # Скрипт настройки хоста BR-FW (Межсетевой экран филиала BR)
+# Поддерживает VirtualBox, Proxmox, VMware (автоопределение интерфейсов)
 # ==============================================================================
 set -e
 
+# --- ПЕРЕМЕННЫЕ ПОД ВАШ ВАРИАНТ ---
 HOSTNAME="br-fw.au-team.irpo"
 TIMEZONE="Europe/Moscow"
+
+IP_FW_NET="172.16.10.2/30"
+GW_FW_NET="172.16.10.1"
+
+IP_BR_NET="172.16.20.1/28"
+
+# --- АВТООПРЕДЕЛЕНИЕ СЕТЕВЫХ ИНТЕРФЕЙСОВ ---
+ETH=($(ip -o link show | awk -F': ' '$2 !~ /^(lo|tun|vlan|virbr|docker)/ {print $2}'))
+INT_RTR="${ETH[0]}" # 1-й адаптер: В сторону BR-RTR
+INT_SRV="${ETH[1]}" # 2-й адаптер: В сторону сервера BR-SRV
+
+echo "=== Определены интерфейсы: RTR=$INT_RTR, SRV=$INT_SRV ==="
 
 echo "[1/4] Имя хоста, часовой пояс и ip_forward..."
 hostnamectl set-hostname "$HOSTNAME"
@@ -15,16 +29,16 @@ grep -q "^net.ipv4.ip_forward=1" /etc/sysctl.conf || echo "net.ipv4.ip_forward=1
 sysctl -p
 
 echo "[2/4] Настройка сетевых интерфейсов..."
-nmcli connection delete "FW-NET" 2>/dev/null || true
-nmcli connection delete "BR-NET" 2>/dev/null || true
+nmcli -t -f UUID,DEVICE connection show | awk -F: -v d="$INT_RTR" '$2==d {print $1}' | xargs -r nmcli connection delete
+nmcli -t -f UUID,DEVICE connection show | awk -F: -v d="$INT_SRV" '$2==d {print $1}' | xargs -r nmcli connection delete
 
 # В сторону BR-RTR
-nmcli connection add type ethernet ifname enp0s3 con-name "FW-NET" \
-    ip4 172.16.10.2/30 gw4 172.16.10.1 ipv4.dns 77.88.8.8 ipv6.method disabled
+nmcli connection add type ethernet ifname "$INT_RTR" con-name "FW-NET" \
+    ip4 "$IP_FW_NET" gw4 "$GW_FW_NET" ipv4.dns 77.88.8.8 ipv6.method disabled
 
 # В сторону сервера BR-SRV
-nmcli connection add type ethernet ifname enp0s8 con-name "BR-NET" \
-    ip4 172.16.20.1/28 ipv6.method disabled
+nmcli connection add type ethernet ifname "$INT_SRV" con-name "BR-NET" \
+    ip4 "$IP_BR_NET" ipv6.method disabled
 
 nmcli connection up "FW-NET" || true
 nmcli connection up "BR-NET" || true
@@ -38,7 +52,7 @@ cat << EOF > /etc/frr/frr.conf
 frr defaults traditional
 hostname $HOSTNAME
 !
-interface enp0s3
+interface $INT_RTR
  no ip ospf passive
 !
 router ospf
